@@ -1,0 +1,19 @@
+# Notebook 실행 환경
+jupyterlab>=4.3,<5
+jupysql>=0.10,<1
+
+# MariaDB 연결과 환경 설정
+SQLAlchemy>=2.0,<3
+mariadb>=1.1,<2
+python-dotenv>=1.0,<2
+
+# RACOI 공개 자료 수집과 파일 처리
+requests>=2.32,<3
+beautifulsoup4>=4.12,<5
+lxml>=5.3,<6
+openpyxl>=3.1,<4
+
+# SQL 결과 표시와 시각화
+pandas>=2.2,<3
+matplotlib>=3.9,<4
+seaborn>=0.13,<1
