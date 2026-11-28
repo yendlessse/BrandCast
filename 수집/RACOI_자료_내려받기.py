@@ -12,11 +12,11 @@ import re
 import time
 import zipfile
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, unquote
+from urllib.parse import urljoin
 from xml.etree import ElementTree
 
 import requests
@@ -26,6 +26,7 @@ from urllib3.util.retry import Retry
 
 DEFAULT_BASE_URL = "https://www.racoi.or.kr"
 TIMEOUT_SECONDS = 30
+KST = timezone(timedelta(hours=9))
 SOURCE_FOLDERS = {
     "internet_response_weekly": "인터넷반응_주간",
     "total_response_monthly": "종합반응_월간",
@@ -87,7 +88,7 @@ def create_session() -> requests.Session:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    return datetime.now(KST).isoformat(timespec="seconds")
 
 
 def _safe_name(value: str) -> str:
@@ -117,7 +118,8 @@ def inspect_json(content: bytes) -> tuple[int | None, dict[str, Any]]:
     value = json.loads(content.decode("utf-8-sig"))
     if isinstance(value, list):
         keys = sorted({key for item in value if isinstance(item, dict) for key in item})
-        return len(value), {"top_level": "list", "fields": keys}
+        null_fields = sorted({key for item in value if isinstance(item, dict) for key, field in item.items() if field is None})
+        return len(value), {"top_level": "list", "fields": keys, "null_fields": null_fields}
     if isinstance(value, dict):
         return None, {"top_level": "object", "fields": sorted(value)}
     return None, {"top_level": type(value).__name__}
@@ -133,10 +135,42 @@ def inspect_xlsx(content: bytes) -> tuple[int | None, dict[str, Any]]:
             xml_path = f"xl/worksheets/sheet{index}.xml"
             root = ElementTree.fromstring(archive.read(xml_path))
             rows = len(root.findall(".//main:sheetData/main:row", namespace))
+            cells = root.findall(".//main:sheetData/main:row/main:c", namespace)
+            columns = []
+            for cell in cells:
+                letters = "".join(character for character in cell.attrib.get("r", "") if character.isalpha())
+                number = 0
+                for character in letters.upper():
+                    number = number * 26 + ord(character) - ord("A") + 1
+                columns.append(number)
             merges = len(root.findall(".//main:mergeCells/main:mergeCell", namespace))
             total_rows += rows
-            sheets.append({"name": sheet.attrib.get("name"), "worksheet": xml_path, "physical_row_count": rows, "merged_cell_count": merges})
+            sheets.append({"name": sheet.attrib.get("name"), "worksheet": xml_path, "physical_row_count": rows, "physical_column_count": max(columns, default=0), "merged_cell_count": merges})
     return total_rows, {"workbook_sheet_count": len(sheets), "sheets": sheets}
+
+
+def content_fingerprint(content: bytes, response_format: str) -> str:
+    """서버 생성 시각·JSON 배열 순서처럼 내용과 무관한 차이를 제외해 비교한다."""
+    if response_format == "json":
+        value = json.loads(content.decode("utf-8-sig"))
+        if isinstance(value, list):
+            value = sorted(
+                value,
+                key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            )
+        canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+    if response_format != "xlsx":
+        return hashlib.sha256(content).hexdigest()
+    digest = hashlib.sha256()
+    with zipfile.ZipFile(BytesIO(content)) as archive:
+        for name in sorted(archive.namelist()):
+            if name == "docProps/core.xml":
+                continue
+            digest.update(name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(archive.read(name))
+    return digest.hexdigest()
 
 
 class RacoiCollector:
@@ -167,33 +201,48 @@ class RacoiCollector:
             handle.write(json.dumps(asdict(result), ensure_ascii=False) + "\n")
 
     def _failure(self, source_name: str, dataset_name: str, source_url: str, period: str | None, pjseq: int | None, nweek: str | None, response: requests.Response | None, error: Exception | str) -> CollectionResult:
-        result = CollectionResult(source_name, dataset_name, "failed", source_url, _now(), period, period, pjseq, nweek, response.status_code if response else None, response.headers.get("Content-Type") if response else None, None, None, None, None, None, None, str(error))
+        result = CollectionResult(source_name, dataset_name, "failed", source_url, _now(), period, period, pjseq, nweek, response.status_code if response is not None else None, response.headers.get("Content-Type") if response is not None else None, None, None, None, None, None, None, str(error))
         self._append_metadata(result)
         return result
 
-    def _save(self, source_name: str, dataset_name: str, source_url: str, period: str | None, pjseq: int | None, nweek: str | None, response: requests.Response) -> CollectionResult:
+    def _existing_file(self, row: dict[str, Any]) -> bool:
+        path = row.get("file_path")
+        normalized = Path(str(path).replace("\\", "/")) if path else None
+        return normalized is not None and (self.project_root / normalized).is_file()
+
+    def _save(self, source_name: str, dataset_name: str, source_url: str, period: str | None, pjseq: int | None, nweek: str | None, response: requests.Response, expected_format: str) -> CollectionResult:
         content = response.content
         response_format = detect_response_format(content)
         if not content:
             raise RacoiCollectionError("응답 본문이 비어 있습니다.")
         if response_format == "html":
             raise RacoiCollectionError("HTML 응답입니다. 로그인/오류 페이지 여부를 확인하세요.")
-        if response_format == "unknown":
-            raise RacoiCollectionError("Excel 또는 JSON 형식이 아닌 응답입니다.")
+        if response_format != expected_format:
+            raise RacoiCollectionError(f"예상 형식은 {expected_format}이지만 {response_format} 응답을 받았습니다.")
         row_count, structure = inspect_xlsx(content) if response_format == "xlsx" else inspect_json(content)
         checksum = hashlib.sha256(content).hexdigest()
-        existing = next((row for row in self._metadata_rows() if row.get("collection_status") == "success" and row.get("source_name") == source_name and row.get("dataset_name") == dataset_name and row.get("checksum") == checksum and row.get("file_path")), None)
+        fingerprint = content_fingerprint(content, response_format)
+        structure["content_fingerprint"] = fingerprint
+        existing = next((row for row in self._metadata_rows() if row.get("collection_status") == "success" and row.get("source_name") == source_name and row.get("dataset_name") == dataset_name and (row.get("checksum") == checksum or (row.get("structure_summary") or {}).get("content_fingerprint") == fingerprint) and self._existing_file(row)), None)
         if existing:
-            result = CollectionResult(source_name, dataset_name, "duplicate", source_url, _now(), period, period, pjseq, nweek, response.status_code, response.headers.get("Content-Type"), response_format, checksum, existing["file_path"], len(content), row_count, structure)
+            if existing.get("checksum") != checksum:
+                structure["received_checksum"] = checksum
+            result = CollectionResult(source_name, dataset_name, "duplicate", source_url, _now(), period, period, pjseq, nweek, response.status_code, response.headers.get("Content-Type"), response_format, existing.get("checksum") or checksum, existing["file_path"], existing.get("byte_count") or len(content), row_count, structure)
             self._append_metadata(result)
             return result
         extension = "xlsx" if response_format == "xlsx" else "json"
         folder = self.raw_root / SOURCE_FOLDERS[source_name]
         folder.mkdir(parents=True, exist_ok=True)
-        name = f"{_safe_name(dataset_name)}_{checksum[:12]}.{extension}"
+        identity = [dataset_name]
+        if pjseq is not None:
+            identity.append(f"pjseq-{pjseq}")
+        if nweek:
+            identity.append(str(nweek))
+        identity.append(checksum[:12])
+        name = f"{_safe_name('_'.join(identity))}.{extension}"
         target = folder / name
         target.write_bytes(content)
-        result = CollectionResult(source_name, dataset_name, "success", source_url, _now(), period, period, pjseq, nweek, response.status_code, response.headers.get("Content-Type"), response_format, checksum, str(target.relative_to(self.project_root)), len(content), row_count, structure)
+        result = CollectionResult(source_name, dataset_name, "success", source_url, _now(), period, period, pjseq, nweek, response.status_code, response.headers.get("Content-Type"), response_format, checksum, target.relative_to(self.project_root).as_posix(), len(content), row_count, structure)
         self._append_metadata(result)
         return result
 
@@ -203,7 +252,7 @@ class RacoiCollector:
         return response
 
     def latest_periods(self, year: int | None = None) -> dict[str, Any]:
-        response = self._post_api("/kobaco/select/report.getLastWeekNMonth.do", {"ordstr": "dfm", "year": year or datetime.now().year})
+        response = self._post_api("/kobaco/select/report.getLastWeekNMonth.do", {"ordstr": "dfm", "year": year or datetime.now(KST).year})
         data = response.json()
         if isinstance(data, list):
             data = data[0] if data else None
@@ -213,12 +262,12 @@ class RacoiCollector:
 
     def _download_excel(self, source_name: str, dataset_name: str, rtype: str, period: str) -> CollectionResult:
         url = self._url("/kobaco/excel/mexceldown.do")
-        payload = {"rtype": rtype, "st": period, "ed": period, "datep_st": period, "datep_ed": period, "filterConditions": _all_genre_filters()}
+        payload = {"rtype": rtype, "st": period, "ed": period, "datep_st": period, "datep_ed": period, "filterConditions": _all_genre_filters(), "parClassList": "[]", "classList": "[]", "channelList": "[]", "siteList": "[]", "ccSiteList": "[]", "rcOnlySiteList": "[]"}
         response: requests.Response | None = None
         try:
             response = self.session.post(url, data=payload, timeout=TIMEOUT_SECONDS)
             response.raise_for_status()
-            return self._save(source_name, dataset_name, url, period, None, None, response)
+            return self._save(source_name, dataset_name, url, period, None, None, response, "xlsx")
         except (requests.RequestException, RacoiCollectionError, ValueError, zipfile.BadZipFile) as error:
             return self._failure(source_name, dataset_name, url, period, None, None, response, error)
 
@@ -259,7 +308,7 @@ class RacoiCollector:
             response: requests.Response | None = None
             try:
                 response = self._post_api(f"/kobaco/select/ott.{endpoint}.do", payload)
-                results.append(self._save("comment_analysis", dataset_name, url, nweek, pjseq, nweek, response))
+                results.append(self._save("comment_analysis", dataset_name, url, nweek, pjseq, nweek, response, "json"))
             except (requests.RequestException, RacoiCollectionError, ValueError, zipfile.BadZipFile) as error:
                 results.append(self._failure("comment_analysis", dataset_name, url, nweek, pjseq, nweek, response, error))
             time.sleep(0.2)

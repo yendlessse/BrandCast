@@ -39,12 +39,10 @@ def _parse_date(value: str) -> date:
 
 def _week_codes(start: date, end: date) -> list[str]:
     codes = []
-    current = start
+    current = start - timedelta(days=start.weekday())
     while current <= end:
         iso_year, iso_week, _ = current.isocalendar()
-        code = f"{iso_year}{iso_week:02d}"
-        if code not in codes:
-            codes.append(code)
+        codes.append(f"{iso_year}{iso_week:02d}")
         current += timedelta(days=7)
     return codes
 
@@ -61,19 +59,26 @@ def _month_codes(start: date, end: date) -> list[str]:
 
 def run(args: argparse.Namespace) -> tuple[list, dict]:
     _read_dotenv()
-    collector = RacoiCollector(PROJECT_ROOT, os.getenv("RACOI_BASE_URL", args.base_url))
+    collector = RacoiCollector(PROJECT_ROOT, os.getenv("RACOI_BASE_URL") or args.base_url)
     periods = collector.latest_periods()
-    if args.start_date and args.end_date:
-        start, end = _parse_date(args.start_date), _parse_date(args.end_date)
+    latest_week, latest_month = str(periods["dfm"]), str(periods["mdfm"])
+    start_value = args.start_date or os.getenv("DATA_START_DATE") or None
+    end_value = args.end_date or os.getenv("DATA_END_DATE") or None
+    if bool(start_value) != bool(end_value):
+        raise ValueError("기간 수집은 시작일과 종료일을 함께 지정해야 합니다.")
+    if args.probe or not start_value:
+        weekly_codes = [latest_week]
+        monthly_codes = [latest_month]
+        mode = "probe"
+    else:
+        start, end = _parse_date(start_value), _parse_date(end_value or "")
         if start > end:
             raise ValueError("시작일은 종료일보다 늦을 수 없습니다.")
-        weekly_codes = _week_codes(start, end)
-        monthly_codes = _month_codes(start, end)
-    elif args.start_date or args.end_date:
-        raise ValueError("기간 수집은 --start-date와 --end-date를 함께 지정해야 합니다.")
-    else:
-        weekly_codes = [str(periods["dfm"])]
-        monthly_codes = [str(periods["mdfm"])]
+        weekly_codes = [code for code in _week_codes(start, end) if code <= latest_week]
+        monthly_codes = [code for code in _month_codes(start, end) if code <= latest_month]
+        if not weekly_codes and not monthly_codes:
+            raise ValueError("최신 완료 주차·월 안에 수집할 기간이 없습니다.")
+        mode = "range"
 
     results = []
     for code in weekly_codes:
@@ -83,7 +88,16 @@ def run(args: argparse.Namespace) -> tuple[list, dict]:
     if not args.skip_comments:
         # 방송 반응 최신 주차와 댓글 최신 주차는 서로 다를 수 있다.
         results.extend(collector.download_comment_analysis(args.comment_pjseq))
-    return results, {"latest_week": periods["dfm"], "latest_month": periods["mdfm"]}
+    return results, {
+        "mode": mode,
+        "requested_start_date": start_value,
+        "requested_end_date": end_value,
+        "latest_week": latest_week,
+        "latest_month": latest_month,
+        "weekly_codes": weekly_codes,
+        "monthly_codes": monthly_codes,
+        "comment_pjseq": None if args.skip_comments else args.comment_pjseq,
+    }
 
 
 def main() -> int:
@@ -92,16 +106,16 @@ def main() -> int:
     parser.add_argument("--end-date", help="수집 종료일 (YYYY-MM-DD)")
     parser.add_argument("--comment-pjseq", type=int, default=DEFAULT_COMMENT_PJSEQ, help="RACOI 프로그램 식별자")
     parser.add_argument("--skip-comments", action="store_true", help="댓글반응 JSON 8종 수집을 건너뜁니다.")
-    parser.add_argument("--probe", action="store_true", help="최신 1주·1개월·댓글 8종만 수집합니다(기본 동작과 동일).")
+    parser.add_argument("--probe", action="store_true", help="기간 설정과 무관하게 최신 1주·1개월·댓글 8종만 수집합니다.")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="RACOI 기본 URL")
     args = parser.parse_args()
     try:
-        results, periods = run(args)
+        results, execution = run(args)
     except (ValueError, RacoiCollectionError, OSError) as error:
         print(json.dumps({"status": "failed", "error": str(error)}, ensure_ascii=False), file=sys.stderr)
         return 2
     summary = summarize_results(results)
-    print(json.dumps({"status": "completed" if not summary["failed"] else "completed_with_failures", "periods": periods, "summary": summary, "results": [result.__dict__ for result in results]}, ensure_ascii=False, indent=2))
+    print(json.dumps({"status": "completed" if not summary["failed"] else "completed_with_failures", "execution": execution, "summary": summary, "results": [result.__dict__ for result in results]}, ensure_ascii=False, indent=2))
     return 0 if not summary["failed"] else 1
 
 
